@@ -18,3 +18,5 @@ Each algo should interface in mostly the same way:
     - Hyperparameters (model-affecting parameters) include the base network, temperatures/importance weights, optimizer (+args).
     - Configuration includes any performance-invariant parameters (CUDA, verbose, etc.)
 - Also add utils for validation
+
+Tested with Python 3.9.21 PyTorch 2.5.1. idk what the compatibility is
