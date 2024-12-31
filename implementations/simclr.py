@@ -13,7 +13,7 @@ from torchvision.models.resnet import (
     resnet152
 )
 
-from implementations.utils import generalized_ntxent
+from implementations.utils import generalized_ntxent, LARS
 
 
 def run_simclr_train(dataset, config):
@@ -109,7 +109,9 @@ def make_new_state(dataset, config):
         torch.optim.AdamW
         if config["optim_class"] == "adamw"
         else (
-            torch.optim.SGD if config["optim_class"] == "sgd" else config["optim_class"]
+            torch.optim.SGD
+            if config["optim_class"] == "sgd"
+            else LARS if config["optim_class"] == "lars" else config["optim_class"]
         )
     )(
         state["model"].parameters(),
