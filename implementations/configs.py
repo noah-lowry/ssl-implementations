@@ -29,7 +29,6 @@ def get_default_simclr_config():
         "optim_kwargs": {
             "lr": 0.3,
             "lr_scaling": "batch_linear",
-            "momentum": 0.1875,  # equivalent to 0.9 from the paper because pytorch does momentum weirdly
             "weight_decay": 1e-6,
             "trust_coefficient": 0.001
         },
@@ -75,7 +74,6 @@ def get_mini_simclr_config():
         "optim_kwargs": {
             "lr": 0.075,
             "lr_scaling": "batch_sqrt",
-            "momentum": 0.1875,  # equivalent to 0.9 from the paper because pytorch does momentum weirdly
             "weight_decay": 1e-6,
             "trust_coefficient": 0.001
         },

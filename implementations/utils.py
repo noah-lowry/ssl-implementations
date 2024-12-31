@@ -1,5 +1,8 @@
 import torch
 from torch.optim.optimizer import Optimizer, required
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.utils.data import Dataset
+from torchvision.transforms import v2
 
 
 def infonce(queries: torch.Tensor, positive_keys: torch.Tensor, negative_keys: torch.Tensor, tau: float = 0.07):
@@ -52,8 +55,8 @@ def generalized_ntxent(tensor: torch.Tensor, pair_matrix: torch.Tensor, tau: flo
         return torch.sum(result * pair_matrix) / torch.sum(pair_matrix)
 
 
-class LARS(torch.optim.Optimizer):
-    
+class LARS(Optimizer):
+
     def __init__(
         self,
         params,
@@ -142,3 +145,70 @@ class LARS(torch.optim.Optimizer):
                 p.add_(d_p, alpha=-group["lr"])
 
         return loss
+
+
+def make_linear_to_cosine_scheduler(optim, max_epochs, warmup_iters=10, eta_min=0, last_epoch=-1):
+    return SequentialLR(
+        optim,
+        schedulers=[
+            LinearLR(
+                optim,
+                start_factor=1e-2,
+                end_factor=1,
+                total_iters=warmup_iters,
+                last_epoch=last_epoch,
+            ),
+            CosineAnnealingLR(
+                optim,
+                T_max=max_epochs - warmup_iters,
+                eta_min=eta_min,
+                last_epoch=last_epoch,
+            ),
+        ],
+        milestones=[warmup_iters],
+        last_epoch=last_epoch,
+    )
+
+def make_simclr_augment_fn(image_size=(224, 224), do_color_distort=True, do_blur=True, crop_scale=(0.08, 1), color_strength=1.0, kernel_size_proportion=0.1):
+    kernel_size = [int(image_size[0]*kernel_size_proportion), int(image_size[1]*kernel_size_proportion)]
+    if kernel_size[0] % 2 == 0:
+        kernel_size[0] += 1
+    if kernel_size[1] % 2 == 0:
+        kernel_size[1] += 1
+
+    return v2.Compose([
+        # Crop resize
+        v2.RandomResizedCrop(size=image_size, scale=crop_scale),
+        v2.RandomHorizontalFlip(p=0.5),
+
+        # Color distort
+        v2.Compose([
+            v2.RandomApply([v2.ColorJitter(brightness=0.8*color_strength, contrast=0.8*color_strength, saturation=0.8*color_strength, hue=0.2*color_strength)], p=0.8),
+            v2.RandomGrayscale(p=0.2),
+        ]) if do_color_distort else v2.Identity(),
+
+        # Gaussian blur
+        v2.RandomApply([v2.GaussianBlur(kernel_size=kernel_size)], p=0.5) if do_blur else v2.Identity()
+    ])
+
+class DoubleAugmentationDataset(Dataset):
+
+    def __init__(self, data, transform, augment_fn, device):
+        super().__init__()
+
+        self.data = data
+        self.transform = transform
+        self.augment_fn = augment_fn
+        self.device = device
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        selected_data = self.data[idx]
+        if self.transform is not None:
+            selected_data = self.transform(selected_data)
+        return (
+            self.augment_fn(selected_data).to(self.device),
+            self.augment_fn(selected_data).to(self.device),
+        )

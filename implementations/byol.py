@@ -1,30 +1,28 @@
 import numpy as np
 from tqdm import tqdm
 import torch
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch import nn
 
+from implementations.utils import LARS, DoubleAugmentationDataset, make_linear_to_cosine_scheduler
+from implementations.modules import ResNetBase, BYOLProjectionHead
 
-from implementations.utils import generalized_ntxent, LARS, DoubleAugmentationDataset, make_linear_to_cosine_scheduler
-from implementations.modules import ResNetBase, SimCLRProjectionHead
-
-
-def run_simclr_train(dataset, config):
+def run_byol_train(dataset, config):
     
     state = make_new_state(dataset, config)
-    simclr_train_loop(state, config)
+    byol_train_loop(state, config)
     return state
 
-def simclr_train_loop(state, config):
+def byol_train_loop(state, config):
 
     for epoch in (bar := tqdm(range(config["max_epochs"]), desc="Training", position=0, unit="epoch")):
         
-        loss = simclr_epoch(
+        loss = byol_epoch(
             state["loader"],
-            state["model"],
+            state["online"],
+            state["target"],
             state["optim"],
-            config["tau"],
+            state["tau"],
             verbose_epoch=config["verbose_epoch"]
         )
         if "scheduler" in state and state["scheduler"] is not None:
@@ -40,7 +38,6 @@ def simclr_train_loop(state, config):
 
 def make_new_state(dataset, config):
 
-    # very readable code
     state = {
         "loader": DataLoader(
             DoubleAugmentationDataset(
@@ -49,10 +46,9 @@ def make_new_state(dataset, config):
                 augment_fn=config["augment_fn"],
                 device=config["device"],
             ),
-            collate_fn=simclr_dataset_collate_fn,
             **config["data_kwargs"],
         ),
-        "model": nn.Sequential(
+        "online": nn.Sequential(
             (
                 ResNetBase(
                     n_channels=config["base_kwargs"]["n_channels"],
@@ -62,15 +58,72 @@ def make_new_state(dataset, config):
                 else config["base_class"](**config["base_kwargs"])
             ),
             (
-                SimCLRProjectionHead(
+                BYOLProjectionHead(
                     in_features=(config["projection_head_kwargs"]["in_features"]),
                     out_features=(
                         config["projection_head_kwargs"]["out_features"]
                         if "out_features" in config["projection_head_kwargs"]
-                        else None
+                        else 256
+                    ),
+                    hidden_dim=(
+                        config["projection_head_kwargs"]["hidden_dim"]
+                        if "hidden_dim" in config["projection_head_kwargs"]
+                        else 4096
                     ),
                 )
-                if config["projection_head_class"] == "simclr_default"
+                if config["projection_head_class"] == "byol_default"
+                else config["projection_head_class"](**config["projection_head_kwargs"])
+            ),
+            (
+                BYOLProjectionHead(
+                    in_features=(
+                        config["predictor_kwargs"]["in_features"]
+                        if "in_features" in config["predictor_kwargs"]
+                        else (
+                            config["projection_head_kwargs"]["out_features"]
+                            if "out_features" in config["projection_head_kwargs"]
+                            else 256
+                        )
+                    ),
+                    out_features=(
+                        config["predictor_kwargs"]["out_features"]
+                        if "out_features" in config["predictor_kwargs"]
+                        else 256
+                    ),
+                    hidden_dim=(
+                        config["predictor_kwargs"]["hidden_dim"]
+                        if "hidden_dim" in config["predictor_kwargs"]
+                        else 4096
+                    ),
+                )
+                if config["predictor_class"] == "byol_default"
+                else config["predictor_class"](**config["predictor_kwargs"])
+            ),
+        ).to(config["device"]),
+        "target": nn.Sequential(
+            (
+                ResNetBase(
+                    n_channels=config["base_kwargs"]["n_channels"],
+                    model=config["base_class"],
+                )
+                if isinstance(config["base_class"], str)
+                else config["base_class"](**config["base_kwargs"])
+            ),
+            (
+                BYOLProjectionHead(
+                    in_features=(config["projection_head_kwargs"]["in_features"]),
+                    out_features=(
+                        config["projection_head_kwargs"]["out_features"]
+                        if "out_features" in config["projection_head_kwargs"]
+                        else 256
+                    ),
+                    hidden_dim=(
+                        config["projection_head_kwargs"]["hidden_dim"]
+                        if "hidden_dim" in config["projection_head_kwargs"]
+                        else 4096
+                    ),
+                )
+                if config["projection_head_class"] == "byol_default"
                 else config["projection_head_class"](**config["projection_head_kwargs"])
             ),
         ).to(config["device"]),
@@ -84,7 +137,7 @@ def make_new_state(dataset, config):
             else LARS if config["optim_class"] == "lars" else config["optim_class"]
         )
     )(
-        state["model"].parameters(),
+        state["online"].parameters(),
         **(
             (
                 lambda optim_kwargs, lr_scaling: (
@@ -140,37 +193,50 @@ def make_new_state(dataset, config):
         "train_loss": [],
         **{name: [] for name in config["monitor_names"]}
     }
+    state["tau"] = config["tau_base"]
 
     return state
 
-def simclr_epoch(loader, model, optim, tau, verbose_epoch=False):
+def byol_loss(q, z):
+    return torch.mean(2 * (1 - torch.bmm(q.unsqueeze(1), z.unsqueeze(2)).squeeze() / (q.norm(dim=1) * z.norm(dim=1))))
+
+def byol_epoch(loader, online, target, optim, tau, verbose_epoch=False):
     """
     ``tau``: temperature tau parameter for the loss function.\n
     Returns the mean contrastive loss.
     """
-    model.train()
+    online.train()
+    target.train()
 
     losses = []
     
     for batch_idx, batch in enumerate(loader if not verbose_epoch else tqdm(loader, desc="Epoch", leave=False, unit="batch", position=1)):
 
-        inputs, pair_matrix = batch
+        x1, x2 = batch
         
-        embeddings = model(inputs)
+        q1 = online(x1)
+        z1 = target(x2).detach()
+        loss1 = byol_loss(q1, z1)
+
+        q2 = online(x2)
+        z2 = target(x1).detach()
+        loss2 = byol_loss(q2, z2)
         
-        loss = generalized_ntxent(embeddings, pair_matrix, tau=tau)
+        loss = loss1 + loss2
         loss.backward()
-        
+
         optim.step()
         optim.zero_grad()
+
+        with torch.no_grad():
+            params_target = torch.nn.utils.parameters_to_vector(target.parameters())
+            params_online = torch.nn.utils.parameters_to_vector(online[:-1].parameters())
+
+            params_target_new = tau*params_target + (1-tau)*params_online
+
+            torch.nn.utils.vector_to_parameters(params_target_new, target.parameters())
+        
 
         losses.append(loss.item())
     
     return np.mean(losses)
-
-def simclr_dataset_collate_fn(items):
-    views = torch.cat([torch.stack(item, dim=0) for item in items], dim=0)
-    pair_matrix = torch.zeros((len(views), len(views)), dtype=torch.bool)
-    rows = torch.arange(0, len(views)-1, 2)
-    pair_matrix[rows, rows+1] = pair_matrix[rows+1, rows] = True
-    return (views, pair_matrix.to(views.device))
